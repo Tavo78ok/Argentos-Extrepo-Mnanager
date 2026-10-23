@@ -9,6 +9,8 @@
 Interfaz gráfica GTK4 + libadwaita construida sobre [extrepo](https://salsa.debian.org/extrepo-team/extrepo), la herramienta oficial de Debian para gestionar repositorios de terceros de forma segura. Toda la acción con privilegios pasa por `pkexec` (polkit), nunca se usa `sudo` ni credenciales en claro.
 
 ---
+<img width="1440" height="900" alt="Captura de pantalla de 2026-10-23 17-16-22" src="https://github.com/user-attachments/assets/9488dc79-40f4-463d-94d4-fe206007afd4" />
+<img width="1440" height="900" alt="Captura de pantalla de 2026-10-23 17-16-47" src="https://github.com/user-attachments/assets/838a4333-e78b-49c0-80e5-befd7674a51f" />
 
 ## ✨ Características
 
@@ -62,14 +64,14 @@ bash build_deb.sh          # produce argentos-extrepo-manager_1.1.0_all.deb
 4. **Selecciona** uno o más paquetes (o «seleccionar todo») y pulsa «Instalar seleccionados».
 5. Los paquetes quedan marcados como *Instalado* en las búsquedas siguientes.
 
-## 🌐 Integración con OpenDash
+## 🌐 Integración con Argent OpenDash
 
 El widget es autocontenido y embebible:
 
 ```python
 from argentos_extrepo_manager import build_tab_widget
 
-# Dentro de OpenDash, con su ToastOverlay existente:
+# Dentro de Argent-OpenDash, con su ToastOverlay existente:
 page = build_tab_widget(toast_overlay=self._toast)
 self._view_stack.add_titled(page, "extrepo", "Repositorios")
 ```
