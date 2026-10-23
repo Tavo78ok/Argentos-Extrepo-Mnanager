@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3AA0EE"/>
+      <stop offset="1" stop-color="#0B4A82"/>
+    </linearGradient>
+    <linearGradient id="boxTop" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#DCEBFA"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="6" y="6" width="116" height="116" rx="28" fill="url(#bg)"/>
+
+  <!-- acento de sol, guiño a OpenArgentOS -->
+  <g stroke="#FFD873" stroke-width="3" stroke-linecap="round" opacity="0.95">
+    <line x1="28" y1="13" x2="28" y2="21"/>
+    <line x1="17" y1="23" x2="23" y2="29"/>
+    <line x1="39" y1="23" x2="33" y2="29"/>
+    <line x1="13" y1="34" x2="21" y2="34"/>
+  </g>
+  <circle cx="28" cy="34" r="6.5" fill="#FFD873"/>
+
+  <!-- caja / paquete: repositorio externo -->
+  <g>
+    <polygon points="64,46 93,58.5 64,71 35,58.5" fill="url(#boxTop)"/>
+    <polygon points="35,58.5 64,71 64,99 35,86.5" fill="#EAF3FC" opacity="0.92"/>
+    <polygon points="93,58.5 64,71 64,99 93,86.5" fill="#C9DFF4" opacity="0.92"/>
+    <polyline points="49,52 64,58.3 79,52" fill="none" stroke="#0B4A82"
+               stroke-width="2.4" stroke-linejoin="round" opacity="0.45"/>
+  </g>
+
+  <!-- insignia "+": agregar repositorio externo -->
+  <circle cx="95" cy="91" r="16.5" fill="#1AC29B"/>
+  <path d="M95 84 v14 M88 91 h14" stroke="#FFFFFF" stroke-width="3.4" stroke-linecap="round"/>
+</svg>

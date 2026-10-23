@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Extrepo Manager
+GenericName=Gestor de repositorios externos
+Comment=Gestor visual de repositorios externos de OpenArgentOS
+Exec=python3 /opt/openargentos/argos-extrepo-manager.py
+Icon=org.openargentos.ExtrepoManager
+Terminal=false
+Categories=System;PackageManager;
+StartupNotify=true
