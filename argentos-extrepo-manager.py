@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """
-ArgentOS Extrepo Manager v1.1.0
+ArgentOS Extrepo Manager v1.2.1
 Gestor visual de repositorios externos para ArgentOS Platinum Edition
 GTK4 + libadwaita | GPLv3
 
 Integración con OpenDash:
     from argentos_extrepo_manager import build_tab_widget
     tab = build_tab_widget(toast_overlay=parent_toast)
+
+Cambios v1.2.1 respecto a v1.2.0:
+  - Parser de `extrepo search` RESTAURADO al de v1.1.0 (compatible con
+    formato "Found <name>:" + YAML separado por "---").
+  - Se ignora la línea separadora "---" al construir el dict.
+  - Se mantienen todos los parches ortogonales (handlers, timers, _alive,
+    diálogo único, timeouts, idempotencia, spinner, filas instaladas).
 """
 
 import gi
@@ -16,13 +23,14 @@ gi.require_version("Adw", "1")
 from gi.repository import Gtk, Adw, GLib, Gio
 import subprocess
 import threading
+import signal
 import sys
 import os
 import glob
 import re
 
 APP_ID  = "org.openargentos.ExtrepoManager"
-VERSION = "1.1.0"
+VERSION = "1.2.1"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -36,23 +44,18 @@ def get_enabled_repos() -> set:
         basename = os.path.basename(path)
         name = basename.removeprefix("extrepo_").removesuffix(".sources")
         try:
-            with open(path) as f:
+            with open(path, encoding="utf-8", errors="replace") as f:
                 content = f.read()
-            # En deb822 el valor por defecto de Enabled es "yes", así que solo
-            # un "Enabled: no" explícito (tolerante a mayúsculas/espacios)
-            # deshabilita el repositorio.
             is_disabled = False
             for line in content.splitlines():
                 key, sep, val = line.partition(":")
                 if sep and key.strip().lower() == "enabled":
-                    if val.strip().lower() == "no":
+                    if val.strip().lower() in ("no", "false", "0"):
                         is_disabled = True
                         break
             if not is_disabled:
                 enabled.add(name)
         except (PermissionError, OSError):
-            # Si no podemos leer el archivo, no asumimos estado: lo marcamos
-            # como habilitado para que el usuario pueda deshabilitarlo de nuevo.
             enabled.add(name)
     return enabled
 
@@ -76,6 +79,17 @@ def run_extrepo_search(keyword: str = "") -> tuple[list, str | None]:
 
 
 def _parse_search_output(output: str) -> list:
+    """
+    Parser compatible con el formato real de extrepo search:
+        Found <nombre>:
+        ---
+        description: ...
+        source:
+          URIs: ...
+        <línea en blanco>
+        Found <nombre>:
+        ...
+    """
     repos = []
     current_name = None
     current_lines: list[str] = []
@@ -93,9 +107,12 @@ def _parse_search_output(output: str) -> list:
 
 
 def _build_repo_dict(name: str, lines: list[str]) -> dict:
-    data = {"name": name, "description": "", "url": "", "suite": "", "components": "", "arch": ""}
+    data = {"name": name, "description": "", "url": "", "suite": "",
+            "components": "", "arch": ""}
     for line in lines:
         s = line.strip()
+        if not s or s == "---":
+            continue
         key, _, val = s.partition(":")
         key = key.strip().lower()
         val = val.strip()
@@ -118,32 +135,55 @@ def _build_repo_dict(name: str, lines: list[str]) -> dict:
 #  Capa de datos: APT / instalación
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_privileged(args: list) -> tuple[bool, str]:
+def run_privileged(args: list, timeout: int = 300) -> tuple[bool, str]:
+    """Ejecuta con pkexec. start_new_session=True permite matar el grupo
+    completo (pkexec + apt-get nieto) en timeout, liberando el lock de dpkg."""
     try:
-        result = subprocess.run(
-            ["pkexec"] + args, capture_output=True, text=True, timeout=300
+        proc = subprocess.Popen(
+            ["pkexec"] + args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
         )
-        if result.returncode == 0:
-            return True, result.stdout.strip() or "Operación completada"
-        elif result.returncode == 126:
-            return False, "Autenticación cancelada"
-        elif result.returncode == 127:
-            return False, "No se pudo autenticar con polkit"
-        else:
-            return False, result.stderr.strip() or f"Error (código {result.returncode})"
-    except subprocess.TimeoutExpired:
-        return False, "Tiempo de espera agotado (300 s)"
-    except Exception as exc:
+    except FileNotFoundError:
+        return False, "pkexec no está disponible"
+    except OSError as exc:
         return False, str(exc)
+
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        return False, f"Tiempo de espera agotado ({timeout} s)"
+
+    rc = proc.returncode
+    if rc == 0:
+        return True, (out or "").strip() or "Operación completada"
+    if rc == 126:
+        return False, "Autenticación cancelada"
+    if rc == 127:
+        return False, "No se pudo autenticar con polkit"
+
+    err = (err or "").strip()
+    low = err.lower()
+    if "already" in low and ("enabled" in low or "disabled" in low):
+        return True, "Sin cambios (ya estaba en ese estado)"
+    return False, err or f"Error (código {rc})"
 
 
 def apt_update() -> tuple[bool, str]:
-    """Actualiza índices APT con privilegios."""
     return run_privileged(["apt-get", "update", "-q"])
 
 
 def _apt_search(pattern: str, names_only: bool) -> tuple[list[dict], int, str]:
-    """Ejecuta apt-cache search y devuelve (paquetes, returncode, stderr)."""
     cmd = ["apt-cache", "search"]
     if names_only:
         cmd.append("--names-only")
@@ -153,22 +193,13 @@ def _apt_search(pattern: str, names_only: bool) -> tuple[list[dict], int, str]:
 
 
 def search_apt_packages(query: str) -> tuple[list[dict], str | None]:
-    """
-    Busca paquetes con apt-cache search.
-    Prueba primero solo en nombres; si no hay resultados, busca en descripciones.
-    Si la query no es una regex válida (apt-cache usa regex), reintenta con
-    la cadena escapada como literal.
-    """
     if not query.strip():
         return [], None
     q = query.strip().replace("_", "-")
     try:
-        # Intento 1: solo nombres (resultados más relevantes)
         pkgs, rc, err = _apt_search(q, names_only=True)
         if rc != 0:
-            # Regex inválida → reintentar como texto literal
             pkgs, rc, err = _apt_search(re.escape(q), names_only=True)
-        # Intento 2: búsqueda amplia si no hay resultados
         if rc == 0 and not pkgs:
             pkgs, rc, err = _apt_search(q, names_only=False)
             if rc != 0:
@@ -196,30 +227,25 @@ def _parse_apt_search(output: str) -> list[dict]:
 
 
 def get_installed_packages() -> set:
-    """Retorna el conjunto de nombres de paquetes instalados."""
     try:
         r = subprocess.run(
             ["dpkg-query", "-W", "-f=${Package}\n"],
-            capture_output=True, text=True, timeout=10
+            capture_output=True, text=True, timeout=10,
         )
         return set(r.stdout.splitlines())
     except Exception:
         return set()
 
 
-def install_apt_packages(packages: list[str]) -> tuple[bool, str]:
-    # --force-confdef/--force-confold evitan que apt-get se cuelgue esperando
-    # una decisión del usuario ante conflictos de archivos de configuración.
-    return run_privileged(
-        ["apt-get", "install", "-y", "-q",
-         "-o", "Dpkg::Options::=--force-confdef",
-         "-o", "Dpkg::Options::=--force-confold",
-         "--no-install-recommends"] + packages
-    )
-
-
-def remove_apt_packages(packages: list[str]) -> tuple[bool, str]:
-    return run_privileged(["apt-get", "remove", "-y"] + packages)
+def install_apt_packages(packages: list[str],
+                         no_recommends: bool = False) -> tuple[bool, str]:
+    cmd = ["apt-get", "install", "-y", "-q",
+           "-o", "Dpkg::Options::=--force-confdef",
+           "-o", "Dpkg::Options::=--force-confold"]
+    if no_recommends:
+        cmd.append("--no-install-recommends")
+    cmd.extend(packages)
+    return run_privileged(cmd, timeout=1800)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -227,8 +253,6 @@ def remove_apt_packages(packages: list[str]) -> tuple[bool, str]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class PackageRow(Adw.ActionRow):
-    """Fila con checkbox para seleccionar un paquete APT."""
-
     def __init__(self, pkg: dict, installed: bool):
         super().__init__()
         self.pkg_name   = pkg["name"]
@@ -240,7 +264,6 @@ class PackageRow(Adw.ActionRow):
             subtitle = subtitle[:82] + "…"
         self.set_subtitle(subtitle or "Sin descripción")
 
-        # Checkbox prefix
         self._check = Gtk.CheckButton()
         self._check.set_valign(Gtk.Align.CENTER)
         self._check.set_active(False)
@@ -248,13 +271,12 @@ class PackageRow(Adw.ActionRow):
         self.add_prefix(self._check)
         self.set_activatable_widget(self._check)
 
-        # Badge "Instalado"
-        if installed:
-            badge = Gtk.Label(label="Instalado")
-            badge.add_css_class("caption")
-            badge.add_css_class("success")
-            badge.set_valign(Gtk.Align.CENTER)
-            self.add_suffix(badge)
+        self._badge = Gtk.Label(label="Instalado")
+        self._badge.add_css_class("caption")
+        self._badge.add_css_class("success")
+        self._badge.set_valign(Gtk.Align.CENTER)
+        self._badge.set_visible(installed)
+        self.add_suffix(self._badge)
 
     def is_selected(self) -> bool:
         return self._check.get_active() and not self._installed
@@ -268,9 +290,11 @@ class PackageRow(Adw.ActionRow):
     def connect_toggled(self, cb):
         self._check.connect("toggled", cb)
 
-    def set_all_sensitive(self, sensitive: bool):
-        if not self._installed:
-            self._check.set_sensitive(sensitive)
+    def mark_installed(self):
+        self._installed = True
+        self._check.set_active(False)
+        self._check.set_sensitive(False)
+        self._badge.set_visible(True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -278,10 +302,6 @@ class PackageRow(Adw.ActionRow):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class InstallDialog(Adw.Window):
-    """
-    Ventana modal: apt-get update → apt-cache search → selección → apt-get install.
-    """
-
     def __init__(self, parent, repo_name: str, parent_toast: Adw.ToastOverlay | None):
         super().__init__()
         self.set_transient_for(parent)
@@ -293,14 +313,22 @@ class InstallDialog(Adw.Window):
         self._repo_name     = repo_name
         self._parent_toast  = parent_toast
         self._pkg_rows: list[PackageRow] = []
-        self._search_timer  = None   # debounce
-        self._bulk_updating = False  # BUG FIX: evita N llamadas a _update_selection en select-all
-        self._search_seq    = 0      # BUG FIX: cancela resultados de búsquedas obsoletas
+        self._search_timer  = None
+        self._bulk_updating = False
+        self._search_seq    = 0
+        self._alive         = True
+        self._pkg_entry_hid = None
 
         self._build_ui()
         self._start_update()
+        self.connect("close-request", self._on_close_request)
 
-    # ── Construcción ──────────────────────────────────────────────────────────
+    def _on_close_request(self, *_):
+        self._alive = False
+        if self._search_timer:
+            GLib.source_remove(self._search_timer)
+            self._search_timer = None
+        return False
 
     def _build_ui(self):
         self._local_toast = Adw.ToastOverlay()
@@ -309,7 +337,6 @@ class InstallDialog(Adw.Window):
         toolbar_view = Adw.ToolbarView()
         self._local_toast.set_child(toolbar_view)
 
-        # HeaderBar
         header = Adw.HeaderBar()
         tw = Adw.WindowTitle()
         tw.set_title("Instalar software")
@@ -317,13 +344,13 @@ class InstallDialog(Adw.Window):
         header.set_title_widget(tw)
         toolbar_view.add_top_bar(header)
 
-        # Stack principal
         self._stack = Gtk.Stack()
         self._stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
         self._stack.set_transition_duration(200)
         toolbar_view.set_content(self._stack)
 
         self._build_page_updating()
+        self._build_page_guide()
         self._build_page_search()
         self._build_page_installing()
         self._build_page_success()
@@ -354,8 +381,6 @@ class InstallDialog(Adw.Window):
         btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         btn_box.set_halign(Gtk.Align.CENTER)
 
-        # BUG FIX: el update es opcional — si el repo se habilitó hace poco,
-        # apt-get update puede tardar o colgar en mirrors lentos.
         skip_btn = Gtk.Button(label="Omitir")
         skip_btn.add_css_class("pill")
         skip_btn.connect("clicked", self._on_skip_update)
@@ -370,10 +395,25 @@ class InstallDialog(Adw.Window):
         box.append(btn_box)
         self._stack.add_named(box, "updating")
 
+    def _build_page_guide(self):
+        page = Adw.StatusPage()
+        page.set_icon_name("system-search-symbolic")
+        page.set_title("Buscar paquetes")
+        page.set_description(
+            "Escribe un nombre de paquete o software para buscarlo\n"
+            f"en el índice APT (repositorio «{self._repo_name}»)."
+        )
+        btn = Gtk.Button(label="Ir a la búsqueda")
+        btn.add_css_class("pill")
+        btn.add_css_class("suggested-action")
+        btn.set_halign(Gtk.Align.CENTER)
+        btn.connect("clicked", lambda _: self._go_to_search())
+        page.set_child(btn)
+        self._stack.add_named(page, "guide")
+
     def _build_page_search(self):
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
 
-        # ── Barra superior ──
         top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         top.set_margin_start(12)
         top.set_margin_end(12)
@@ -383,7 +423,9 @@ class InstallDialog(Adw.Window):
         self._pkg_entry = Gtk.SearchEntry()
         self._pkg_entry.set_hexpand(True)
         self._pkg_entry.set_placeholder_text("Buscar paquete…")
-        self._pkg_entry.connect("search-changed", self._on_pkg_search_changed)
+        self._pkg_entry_hid = self._pkg_entry.connect(
+            "search-changed", self._on_pkg_search_changed
+        )
         top.append(self._pkg_entry)
 
         self._search_spin = Gtk.Spinner()
@@ -393,17 +435,17 @@ class InstallDialog(Adw.Window):
         root.append(top)
         root.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
 
-        # ── Barra de acción ──
         action = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         action.set_margin_start(12)
         action.set_margin_end(12)
         action.set_margin_top(6)
         action.set_margin_bottom(6)
 
-        # Checkbox "seleccionar todo"
         self._select_all_check = Gtk.CheckButton()
         self._select_all_check.set_tooltip_text("Seleccionar / deseleccionar todo")
-        self._select_all_check.connect("toggled", self._on_select_all_toggled)
+        self._select_all_hid = self._select_all_check.connect(
+            "toggled", self._on_select_all_toggled
+        )
         action.append(self._select_all_check)
 
         self._sel_label = Gtk.Label(label="Ningún paquete seleccionado")
@@ -423,13 +465,11 @@ class InstallDialog(Adw.Window):
         root.append(action)
         root.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
 
-        # ── Área de contenido: stack lista / estado vacío ──
         self._list_stack = Gtk.Stack()
         self._list_stack.set_vexpand(True)
         self._list_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
         self._list_stack.set_transition_duration(150)
 
-        # Página: lista de paquetes
         scroll = Gtk.ScrolledWindow()
         scroll.set_vexpand(True)
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -445,7 +485,6 @@ class InstallDialog(Adw.Window):
         scroll.set_child(self._pkg_list)
         self._list_stack.add_named(scroll, "list")
 
-        # Página: estado vacío — con botón de actualizar
         self._empty_page = Adw.StatusPage()
         self._empty_page.set_icon_name("package-x-generic-symbolic")
         self._empty_page.set_title("No se encontraron paquetes")
@@ -476,10 +515,9 @@ class InstallDialog(Adw.Window):
         box.set_margin_top(48)
         box.set_margin_bottom(48)
 
-        spin = Gtk.Spinner()
-        spin.set_size_request(48, 48)
-        spin.start()
-        box.append(spin)
+        self._installing_spin = Gtk.Spinner()
+        self._installing_spin.set_size_request(48, 48)
+        box.append(self._installing_spin)
 
         self._installing_lbl = Gtk.Label()
         self._installing_lbl.add_css_class("title-3")
@@ -522,17 +560,13 @@ class InstallDialog(Adw.Window):
 
         back_btn = Gtk.Button(label="Volver a la búsqueda")
         back_btn.add_css_class("pill")
-        back_btn.connect("clicked", lambda _: self._stack.set_visible_child_name("search"))
+        back_btn.connect("clicked", lambda _: self._go_to_search())
         btn_box.append(back_btn)
 
         self._error_page.set_child(btn_box)
         self._stack.add_named(self._error_page, "error")
 
-    # ── Flujo: update → search ────────────────────────────────────────────────
-
     def _start_update(self):
-        # BUG FIX: mostrar página de confirmación en lugar de lanzar apt-get update
-        # automáticamente — evita colgar la UI si un mirror es lento o inaccesible.
         self._update_spinner.stop()
         self._update_lbl.set_label("¿Actualizar lista de paquetes?")
         self._update_sub.set_label(
@@ -541,46 +575,47 @@ class InstallDialog(Adw.Window):
         self._stack.set_visible_child_name("updating")
 
     def _on_skip_update(self, _btn):
-        """Ir directo a búsqueda sin actualizar listas APT."""
         self._go_to_search()
 
     def _on_confirm_update(self, _btn):
-        """Lanzar apt-get update con pkexec y mostrar spinner."""
         self._update_spinner.start()
         self._update_lbl.set_label("Actualizando lista de paquetes…")
         self._update_sub.set_label("Se requiere autenticación (polkit)")
-        # Deshabilitar también el botón de la página vacía si está visible
         self._empty_update_btn.set_sensitive(False)
         self._stack.set_visible_child_name("updating")
 
         def worker():
             ok, msg = apt_update()
+            if not self._alive:
+                return
             GLib.idle_add(self._on_update_done, ok, msg)
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _go_to_search(self):
+        if not self._alive:
+            return
         self._stack.set_visible_child_name("search")
-        self._pkg_entry.handler_block_by_func(self._on_pkg_search_changed)
-        self._pkg_entry.set_text(self._repo_name)
-        self._pkg_entry.handler_unblock_by_func(self._on_pkg_search_changed)
-        self._do_search(self._repo_name)
+        if not self._pkg_entry.get_text().strip():
+            self._clear_pkg_list()
+        self._pkg_entry.grab_focus()
 
     def _on_update_done(self, ok: bool, msg: str):
+        if not self._alive:
+            return
         self._update_spinner.stop()
         self._empty_update_btn.set_sensitive(True)
         if ok:
             self._go_to_search()
+            self._show_local_toast("Índice APT actualizado")
         else:
             self._error_page.set_description(msg)
             self._stack.set_visible_child_name("error")
 
-    # ── Búsqueda ──────────────────────────────────────────────────────────────
-
     def _on_pkg_search_changed(self, entry):
-        # Debounce 400 ms para no lanzar una búsqueda por cada tecla
         if self._search_timer:
             GLib.source_remove(self._search_timer)
+            self._search_timer = None
         q = entry.get_text().strip()
         if q:
             self._search_timer = GLib.timeout_add(400, self._fire_search, q)
@@ -589,6 +624,8 @@ class InstallDialog(Adw.Window):
 
     def _fire_search(self, query: str):
         self._search_timer = None
+        if not self._alive:
+            return GLib.SOURCE_REMOVE
         self._do_search(query)
         return GLib.SOURCE_REMOVE
 
@@ -597,20 +634,20 @@ class InstallDialog(Adw.Window):
         self._search_spin.start()
         self._install_btn.set_sensitive(False)
 
-        # BUG FIX: incrementar secuencia para descartar resultados de hilos obsoletos
         self._search_seq += 1
         my_seq = self._search_seq
 
         def worker():
             pkgs, err = search_apt_packages(query)
             installed = get_installed_packages()
+            if not self._alive:
+                return
             GLib.idle_add(self._on_search_done, pkgs, installed, err, my_seq)
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_search_done(self, pkgs: list, installed: set, err: str | None, seq: int):
-        # Ignorar si ya lanzamos una búsqueda más nueva
-        if seq != self._search_seq:
+        if not self._alive or seq != self._search_seq:
             return
 
         self._search_spin.stop()
@@ -629,15 +666,14 @@ class InstallDialog(Adw.Window):
             self._pkg_rows.append(row)
             self._pkg_list.append(row)
 
-        # Resetear "seleccionar todo"
-        self._select_all_check.handler_block_by_func(self._on_select_all_toggled)
+        self._select_all_check.handler_block(self._select_all_hid)
         self._select_all_check.set_active(False)
-        self._select_all_check.handler_unblock_by_func(self._on_select_all_toggled)
+        self._select_all_check.handler_unblock(self._select_all_hid)
 
         if pkgs:
             self._list_stack.set_visible_child_name("list")
+            self._select_all_check.set_visible(True)
         else:
-            # Sin resultados: mostrar página de estado vacío con botón de acción
             q = self._pkg_entry.get_text().strip()
             self._empty_page.set_description(
                 f"No se encontraron paquetes para «{q}».\n\n"
@@ -646,7 +682,6 @@ class InstallDialog(Adw.Window):
                 "o escribe otro término de búsqueda."
             )
             self._list_stack.set_visible_child_name("empty")
-            # Ocultar barra de selección cuando no hay nada que seleccionar
             self._select_all_check.set_visible(False)
 
         self._update_selection()
@@ -662,13 +697,8 @@ class InstallDialog(Adw.Window):
         self._list_stack.set_visible_child_name("list")
         self._update_selection()
 
-    # ── Selección ─────────────────────────────────────────────────────────────
-
     def _on_select_all_toggled(self, check):
         active = check.get_active()
-        # BUG FIX: handler_block_by_func con lambdas no funciona porque cada lambda
-        # es un objeto distinto. Usamos un flag para suprimir los callbacks
-        # individuales y llamar _update_selection una sola vez al final.
         self._bulk_updating = True
         for row in self._pkg_rows:
             if not row.is_installed():
@@ -677,11 +707,9 @@ class InstallDialog(Adw.Window):
         self._update_selection()
 
     def _update_selection(self):
-        # BUG FIX: no ejecutar durante operación masiva de select-all
         if self._bulk_updating:
             return
-        selected = [r for r in self._pkg_rows if r.is_selected()]
-        n = len(selected)
+        n = sum(1 for r in self._pkg_rows if r.is_selected())
         if n == 0:
             self._sel_label.set_label("Ningún paquete seleccionado")
         elif n == 1:
@@ -690,8 +718,6 @@ class InstallDialog(Adw.Window):
             self._sel_label.set_label(f"{n} paquetes seleccionados")
         self._install_btn.set_sensitive(n > 0)
 
-    # ── Instalación ───────────────────────────────────────────────────────────
-
     def _on_install_clicked(self, _btn):
         selected = [r.pkg_name for r in self._pkg_rows if r.is_selected()]
         if not selected:
@@ -699,18 +725,30 @@ class InstallDialog(Adw.Window):
 
         label = selected[0] if len(selected) == 1 else f"{len(selected)} paquetes"
         self._installing_lbl.set_label(f"Instalando {label}…")
+        self._installing_spin.start()
         self._stack.set_visible_child_name("installing")
 
         def worker():
             ok, msg = install_apt_packages(selected)
+            if not self._alive:
+                return
             GLib.idle_add(self._on_install_done, ok, msg, selected)
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_install_done(self, ok: bool, msg: str, installed_pkgs: list):
+        if not self._alive:
+            return
+        self._installing_spin.stop()
+
         if ok:
+            sel_set = set(installed_pkgs)
+            for row in self._pkg_rows:
+                if row.pkg_name in sel_set:
+                    row.mark_installed()
+            self._update_selection()
+
             self._stack.set_visible_child_name("success")
-            # Notificar también en el overlay de la ventana principal
             if self._parent_toast:
                 n = len(installed_pkgs)
                 label = installed_pkgs[0] if n == 1 else f"{n} paquetes"
@@ -721,9 +759,9 @@ class InstallDialog(Adw.Window):
             self._error_page.set_description(msg)
             self._stack.set_visible_child_name("error")
 
-    # ── Toasts locales ────────────────────────────────────────────────────────
-
     def _show_local_toast(self, msg: str, timeout: int = 4):
+        if not self._alive:
+            return
         t = Adw.Toast.new(msg)
         t.set_timeout(timeout)
         self._local_toast.add_toast(t)
@@ -832,10 +870,17 @@ class ExtrepoWidget(Gtk.Box):
         self._rows: dict       = {}
         self._filter_mode: str = "all"
         self._search_text: str = ""
+        self._alive: bool      = True
+        self._active_dialog    = None
 
         self._build_toolbar()
         self._build_list_area()
         self._load_repos()
+
+        self.connect("unrealize", self._on_unrealize)
+
+    def _on_unrealize(self, *_):
+        self._alive = False
 
     # ── Toolbar ───────────────────────────────────────────────────────────────
 
@@ -901,7 +946,6 @@ class ExtrepoWidget(Gtk.Box):
         self._stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
         self.append(self._stack)
 
-        # Cargando
         loading = Adw.StatusPage()
         loading.set_icon_name("folder-remote-symbolic")
         loading.set_title("Cargando repositorios…")
@@ -911,7 +955,6 @@ class ExtrepoWidget(Gtk.Box):
         loading.set_child(spin)
         self._stack.add_named(loading, "loading")
 
-        # Error
         self._error_page = Adw.StatusPage()
         self._error_page.set_icon_name("dialog-error-symbolic")
         self._error_page.set_title("No se pudieron cargar los repositorios")
@@ -923,7 +966,6 @@ class ExtrepoWidget(Gtk.Box):
         self._error_page.set_child(retry_btn)
         self._stack.add_named(self._error_page, "error")
 
-        # Lista
         scroll = Gtk.ScrolledWindow()
         scroll.set_vexpand(True)
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -960,11 +1002,15 @@ class ExtrepoWidget(Gtk.Box):
         def worker():
             repos, error = run_extrepo_search(keyword)
             enabled = get_enabled_repos()
+            if not self._alive:
+                return
             GLib.idle_add(self._on_repos_loaded, repos, enabled, error)
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_repos_loaded(self, repos, enabled, error):
+        if not self._alive:
+            return
         if error:
             self._error_page.set_description(error)
             self._stack.set_visible_child_name("error")
@@ -1014,10 +1060,16 @@ class ExtrepoWidget(Gtk.Box):
     def _update_count(self):
         visible = sum(1 for r in self._rows.values() if self._row_matches(r))
         total   = len(self._rows)
+        def plural(n, sing, plur):
+            return f"{n} {sing}" if n == 1 else f"{n} {plur}"
         if self._search_text or self._filter_mode == "active":
-            self._count_label.set_label(f"{visible} de {total} repositorios")
+            self._count_label.set_label(
+                f"{visible} de {plural(total, 'repositorio', 'repositorios')}"
+            )
         else:
-            self._count_label.set_label(f"{total} repositorios disponibles")
+            self._count_label.set_label(
+                f"{plural(total, 'repositorio disponible', 'repositorios disponibles')}"
+            )
 
     # ── Toggle repo ───────────────────────────────────────────────────────────
 
@@ -1032,17 +1084,21 @@ class ExtrepoWidget(Gtk.Box):
 
         def worker():
             ok, msg = run_privileged(["extrepo", action, name])
+            if not self._alive:
+                return
             GLib.idle_add(self._on_toggle_done, row, name, enabling, ok, msg)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_toggle_done(self, row: RepoRow, name: str, enabling: bool, ok: bool, msg: str):
+    def _on_toggle_done(self, row: RepoRow, name: str, enabling: bool,
+                        ok: bool, msg: str):
+        if not self._alive:
+            return
         row.set_busy(False)
         if ok:
             row.set_enabled(enabling)
             if enabling:
                 self._enabled_set.add(name)
-                # Toast con acción directa para abrir el instalador
                 if self._toast_overlay:
                     t = Adw.Toast.new(f"Repositorio {name} habilitado")
                     t.set_button_label("Instalar software")
@@ -1061,8 +1117,18 @@ class ExtrepoWidget(Gtk.Box):
     # ── Abrir diálogo de instalación ──────────────────────────────────────────
 
     def _on_open_install(self, row: RepoRow):
+        if self._active_dialog is not None:
+            self._active_dialog.present()
+            return
         parent = self.get_root()
         dlg = InstallDialog(parent, row.repo_data["name"], self._toast_overlay)
+
+        def _on_close(*_):
+            self._active_dialog = None
+            return False
+
+        dlg.connect("close-request", _on_close)
+        self._active_dialog = dlg
         dlg.present()
 
     # ── Actualizar índice extrepo ─────────────────────────────────────────────
@@ -1075,27 +1141,32 @@ class ExtrepoWidget(Gtk.Box):
 
         def worker():
             ok, msg = run_privileged(["extrepo", "update"])
+            if not self._alive:
+                return
             GLib.idle_add(self._on_update_done, ok, msg)
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_update_done(self, ok: bool, msg: str):
+        if not self._alive:
+            return
         self._global_spinner.stop()
         self._global_spinner.set_visible(False)
         self._update_btn.set_sensitive(True)
         if ok:
             self._toast("Índice actualizado — recargando lista…")
-            self._load_repos(self._search_text)
+            self._load_repos("")
         else:
             self._toast(f"Error al actualizar: {msg}", timeout=6)
 
     # ── Toasts ────────────────────────────────────────────────────────────────
 
     def _toast(self, msg: str, timeout: int = 3):
-        if self._toast_overlay:
-            t = Adw.Toast.new(msg)
-            t.set_timeout(timeout)
-            self._toast_overlay.add_toast(t)
+        if not self._alive or not self._toast_overlay:
+            return
+        t = Adw.Toast.new(msg)
+        t.set_timeout(timeout)
+        self._toast_overlay.add_toast(t)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
